@@ -1,123 +1,110 @@
-import sqlite3
-import pickle
-import os
+from pymongo import MongoClient
 from datetime import datetime
+import numpy as np
+from config import Config
 
-class DatabaseManager:
+class Database:
     def __init__(self):
-        self.db_path = "models/users.db"
-        self.face_data_path = "models/face_data.pkl"
-        self.init_database()
+        self.client = MongoClient(Config.MONGO_URI)
+        self.db = self.client[Config.DB_NAME]
+        self.users = self.db.users
+        self.login_attempts = self.db.login_attempts
+        self._create_indexes()
     
-    def init_database(self):
-        """Initialize database and storage directory"""
-        os.makedirs("models", exist_ok=True)
-        
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                full_name TEXT,
-                email TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_login TIMESTAMP,
-                is_active BOOLEAN DEFAULT 1
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS login_attempts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT,
-                success BOOLEAN,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                confidence REAL
-            )
-        ''')
-        
-        conn.commit()
-        conn.close()
-        
-        # Initialize face data storage
-        if not os.path.exists(self.face_data_path):
-            with open(self.face_data_path, 'wb') as f:
-                pickle.dump({}, f)
+    def _create_indexes(self):
+        """Create database indexes for better performance"""
+        self.users.create_index("username", unique=True)
+        self.login_attempts.create_index([("timestamp", -1)])
     
-    def add_user(self, username, full_name="", email=""):
-        """Add a new user to the database"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+    def add_user(self, username, full_name, email, face_encoding):
+        """Add a new user with face encoding"""
         try:
-            cursor.execute(
-                "INSERT INTO users (username, full_name, email) VALUES (?, ?, ?)",
-                (username, full_name, email)
-            )
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-        finally:
-            conn.close()
+            user_data = {
+                'username': username,
+                'full_name': full_name,
+                'email': email,
+                'face_encoding': face_encoding.tolist(),  # Convert numpy array to list
+                'created_at': datetime.utcnow(),
+                'last_login': None,
+                'is_active': True
+            }
+            result = self.users.insert_one(user_data)
+            return True, str(result.inserted_id)
+        except Exception as e:
+            return False, str(e)
     
-    def user_exists(self, username):
-        """Check if user exists"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM users WHERE username = ? AND is_active = 1", (username,))
-        result = cursor.fetchone()
-        conn.close()
-        return result is not None
+    def get_user_by_username(self, username):
+        """Get user by username"""
+        return self.users.find_one({'username': username, 'is_active': True})
     
     def get_all_users(self):
         """Get all active users"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT username, full_name, email, created_at FROM users WHERE is_active = 1")
-        users = cursor.fetchall()
-        conn.close()
+        users = list(self.users.find({'is_active': True}, {
+            '_id': 0,
+            'username': 1,
+            'full_name': 1,
+            'email': 1,
+            'created_at': 1,
+            'last_login': 1
+        }))
         return users
+    
+    def get_all_face_encodings(self):
+        """Get all face encodings with usernames"""
+        users = self.users.find({'is_active': True}, {
+            'username': 1,
+            'face_encoding': 1
+        })
+        
+        encodings = {}
+        for user in users:
+            if 'face_encoding' in user:
+                encodings[user['username']] = np.array(user['face_encoding'])
+        
+        return encodings
+    
+    def update_last_login(self, username):
+        """Update user's last login time"""
+        self.users.update_one(
+            {'username': username},
+            {'$set': {'last_login': datetime.utcnow()}}
+        )
     
     def delete_user(self, username):
         """Soft delete a user"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE users SET is_active = 0 WHERE username = ?", (username,))
-        success = cursor.rowcount > 0
-        conn.commit()
-        conn.close()
-        return success
-    
-    def log_login_attempt(self, username, success, confidence=0.0):
-        """Log login attempt for audit trail"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO login_attempts (username, success, confidence) VALUES (?, ?, ?)",
-            (username, success, confidence)
+        result = self.users.update_one(
+            {'username': username},
+            {'$set': {'is_active': False}}
         )
-        
-        if success:
-            cursor.execute(
-                "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE username = ?",
-                (username,)
-            )
-        
-        conn.commit()
-        conn.close()
+        return result.modified_count > 0
+    
+    def log_login_attempt(self, username, success, confidence):
+        """Log a login attempt"""
+        attempt_data = {
+            'username': username,
+            'success': success,
+            'confidence': confidence,
+            'timestamp': datetime.utcnow()
+        }
+        self.login_attempts.insert_one(attempt_data)
     
     def get_login_history(self, limit=50):
         """Get recent login history"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT username, success, timestamp, confidence 
-            FROM login_attempts 
-            ORDER BY timestamp DESC 
-            LIMIT ?
-        ''', (limit,))
-        history = cursor.fetchall()
-        conn.close()
+        history = list(self.login_attempts.find(
+            {},
+            {'_id': 0}
+        ).sort('timestamp', -1).limit(limit))
         return history
+    
+    def get_user_stats(self):
+        """Get user statistics"""
+        total_users = self.users.count_documents({'is_active': True})
+        total_attempts = self.login_attempts.count_documents({})
+        successful_attempts = self.login_attempts.count_documents({'success': True})
+        
+        return {
+            'total_users': total_users,
+            'total_attempts': total_attempts,
+            'successful_attempts': successful_attempts,
+            'failed_attempts': total_attempts - successful_attempts
+        }
